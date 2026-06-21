@@ -1,0 +1,145 @@
+# syntax=docker/dockerfile:1
+#
+# Derived image: guangrli:slime-greenland + AWS EFA userspace + aws-ofi-nccl.
+# ─────────────────────────────────────────────────────────────────────────────
+# WHY THIS EXISTS
+#   The base image (guangrli:slime-greenland) has the EFA *hardware* passed
+#   through (/dev/infiniband/uverbs*) and distro libfabric, but NOT the
+#   aws-ofi-nccl plugin. Without that plugin NCCL logs:
+#       NCCL INFO NET/Plugin: Could not find: libnccl-net.so
+#       NCCL INFO NET/IB : No device found.
+#       NCCL INFO Using network Socket          <-- falls back to TCP
+#   and multi-node training runs ~20x slow over TCP sockets instead of EFA/RDMA.
+#   This layer adds the AWS EFA userspace stack + the aws-ofi-nccl net plugin so
+#   NCCL selects EFA. Verified-missing on the running SDB (same base image),
+#   2026-06-18; see memory greenland-slime-image-efa-missing.
+#
+# WHAT IT CHANGES (purely additive — no base behaviour altered)
+#   * Runs AWS efa-installer in --enable-ngc mode: installs the EFA userspace
+#     (libfabric-aws into /opt/amazon/efa) AND the prebuilt, AWS-tuned
+#     aws-ofi-nccl plugin (libnccl-net.so) — no from-source compile. Kernel
+#     module SKIPPED (the host provides it; can't build kmod in a container).
+#   * Registers the plugin + libfabric dirs with ldconfig so NCCL's
+#     dlopen("libnccl-net.so") and the plugin's libfabric.so.1 resolve from the
+#     linker cache. Deliberately does NOT set LD_LIBRARY_PATH, so the run
+#     script's SKIP_SYS_LDPATH cuDNN workaround stays intact.
+#
+# BUILD (needs ECR pull on the SOURCE account 241893993881 + push on yours 339):
+#   aws ecr get-login-password --region ap-south-1 --profile <profile-with-241-pull> \
+#     | docker login --username AWS --password-stdin 241893993881.dkr.ecr.ap-south-1.amazonaws.com
+#   aws ecr get-login-password --region ap-south-1 --profile greenland-dev \
+#     | docker login --username AWS --password-stdin 339712697413.dkr.ecr.ap-south-1.amazonaws.com
+#   docker build -f Dockerfile.slime-greenland-efa_mns \
+#     -t 339712697413.dkr.ecr.ap-south-1.amazonaws.com/whx/slime-greenland-efa:latest .
+#   docker push 339712697413.dkr.ecr.ap-south-1.amazonaws.com/whx/slime-greenland-efa:latest
+#
+# RUN (override the CLI image; the greenland-dev-role @ 339 must have ECR read):
+#   python greenland_cli_mns.py obx --script examples/math_reasoning/run_qwen35_4b_base_mns.sh \
+#     --num-nodes 2 \
+#     --image 339712697413.dkr.ecr.ap-south-1.amazonaws.com/whx/slime-greenland-efa:latest
+#
+# VERIFY EFA IS LIVE (inside a node; should show OFI/efa, not Socket):
+#   NCCL_DEBUG=INFO ... torchrun ...  ->  "NET/OFI ... Selected provider is efa
+#   ... Using transport protocol RDMA"
+# ─────────────────────────────────────────────────────────────────────────────
+
+ARG BASE_IMAGE=241893993881.dkr.ecr.ap-south-1.amazonaws.com/guangrli:slime-greenland
+FROM ${BASE_IMAGE}
+
+# Pin to control reproducibility. If the tag 404s at build time, bump it:
+#   - EFA installer versions:  https://efa-installer.amazonaws.com/ (…-<ver>.tar.gz)
+#     (the installer bundles the matching aws-ofi-nccl plugin .deb)
+ARG EFA_INSTALLER_VERSION=latest
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# 1. Runtime tool the multinode entrypoint needs (hostname -I works regardless,
+#    but iproute2 is cheap insurance). No build toolchain needed — see step 2.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        iproute2 \
+    && rm -rf /var/lib/apt/lists/*
+
+# 2. AWS EFA userspace + the prebuilt aws-ofi-nccl plugin, via the official
+#    installer in --enable-ngc mode.
+#    WHY --enable-ngc: the base is an NGC-style image (NVIDIA GPU Cloud) that
+#    already ships its own libfabric. --enable-ngc is AWS's path for this; it
+#    implies --skip-kmod --skip-limit-conf --skip-mpi --no-verify --yes and
+#    installs the NGC-tuned libnccl-ofi plugin (libnccl-net.so) PREBUILT — no
+#    libtool/git/autogen compile needed, and ABI-matched by AWS.
+#
+#    WHY THE rdma-core PRE-STEP (verified on the running SDB, 2026-06-18): the
+#    installer's libfabric1-aws depends on `ibverbs-providers (>= 59)`, but the
+#    base ships Ubuntu 24.04's rdma-core 50 (and apt offers only 50). Without
+#    fixing this first, efa_installer aborts with:
+#       "libfabric1-aws depends on ibverbs-providers (>= 59); however: ... 50.0"
+#       "Failed to install package .../libfabric1-aws... (NGC build image use case)"
+#    The installer BUNDLES rdma-core 61 debs under DEBS/UBUNTU2404/x86_64/rdma-core/
+#    but --enable-ngc doesn't apply them, so we dpkg -i them up front. After this,
+#    efa_installer --enable-ngc completes and drops the plugin in /opt/amazon/ofi-nccl.
+RUN cd /tmp \
+    && curl -fsSL -O "https://efa-installer.amazonaws.com/aws-efa-installer-${EFA_INSTALLER_VERSION}.tar.gz" \
+    && tar -xf "aws-efa-installer-${EFA_INSTALLER_VERSION}.tar.gz" \
+    && cd aws-efa-installer \
+    && RDMA_DIR="$(find . -type d -path '*UBUNTU2404/x86_64/rdma-core' | head -1)" \
+    && echo "installing bundled rdma-core from ${RDMA_DIR}" \
+    && dpkg -i "${RDMA_DIR}"/*.deb \
+    && ./efa_installer.sh --enable-ngc \
+    && cd /tmp && rm -rf /tmp/aws-efa-installer*
+
+# 3. Make the plugin + AWS libfabric discoverable via the linker cache, so NCCL's
+#    dlopen("libnccl-net.so") finds it WITHOUT us setting LD_LIBRARY_PATH (which
+#    would risk re-triggering the cuDNN-prepend conflict the run script avoids
+#    via SKIP_SYS_LDPATH). The installer drops the plugin under /opt/amazon/ofi-nccl
+#    and libfabric under /opt/amazon/efa; register both, then HARD-FAIL the build
+#    if the plugin lib didn't land (so a silent install regression can't ship).
+# CRITICAL FILENAME FIX (root cause of the first live run falling back to TCP):
+# the EFA installer names the plugin `libnccl-net-ofi.so`, but NCCL dlopen()s the
+# GENERIC name `libnccl-net.so`. Without a matching name NCCL logs
+# "NET/Plugin: Could not find: libnccl-net.so" -> "Using network Socket" (the slow
+# path), even though the plugin is present. Fix: symlink libnccl-net.so ->
+# libnccl-net-ofi.so in the plugin dir so NCCL's dlopen("libnccl-net.so") resolves.
+# NOTE: ldconfig does NOT catalog an unversioned `.so` symlink (it only caches
+# soname'd `.so.N` runtime libs), so we assert the SYMLINK FILE exists + is
+# loadable, NOT that it's in `ldconfig -p`. NCCL resolves it via the plugin dir on
+# the loader path (registered below) + the explicit NCCL_NET_PLUGIN env.
+RUN set -eux; \
+    PLUGIN_LIB="$(find /opt/amazon /usr -name 'libnccl-net-ofi.so*' 2>/dev/null | head -1)"; \
+    [ -z "${PLUGIN_LIB}" ] && PLUGIN_LIB="$(find /opt/amazon /usr -name 'libnccl-net*.so*' 2>/dev/null | head -1)"; \
+    test -n "${PLUGIN_LIB}"; \
+    PLUGIN_DIR="$(dirname "${PLUGIN_LIB}")"; \
+    ln -sf "${PLUGIN_LIB}" "${PLUGIN_DIR}/libnccl-net.so"; \
+    printf '%s\n%s\n' "${PLUGIN_DIR}" '/opt/amazon/efa/lib' \
+        > /etc/ld.so.conf.d/000-aws-ofi-nccl.conf; \
+    ldconfig; \
+    echo "== sanity: plugin symlink + libfabric =="; \
+    ls -l "${PLUGIN_DIR}/libnccl-net.so"; \
+    test -e "${PLUGIN_DIR}/libnccl-net.so"; \
+    ldconfig -p | grep -E 'libnccl-net-ofi|libfabric'; \
+    echo "PLUGIN_DIR=${PLUGIN_DIR}" > /etc/nccl-plugin-dir
+
+# 4. EFA/NCCL runtime defaults. Safe on single-node too (NCCL ignores EFA when no
+#    peer). FI_EFA_USE_DEVICE_RDMA=1 enables RDMA on p5en H200; the socket-iface
+#    pins are also set by the run script for the cross-node case.
+# NCCL_NET_PLUGIN must be the ABSOLUTE PATH, not a bare name. Verified against this
+# image: dlopen("libnccl-net.so") FAILS (the unversioned .so symlink is not in the
+# ldconfig cache — ldconfig only catalogs soname'd .so.N — and /opt/amazon/ofi-nccl/lib
+# is not on LD_LIBRARY_PATH), but dlopen("/opt/amazon/ofi-nccl/lib/libnccl-net.so")
+# SUCCEEDS. A bare name made NCCL log "Could not find: libnccl-net.so" -> TCP Socket
+# on the live run even with the symlink present. The absolute path skips the search.
+#
+# LD_LIBRARY_PATH prepends /opt/amazon/efa/lib — CRITICAL: the plugin links libfabric
+# and needs symbol version FABRIC_1.8. The AWS libfabric in /opt/amazon/efa/lib has it
+# (exports up to FABRIC_1.8); the Ubuntu system libfabric at /usr/lib/x86_64-linux-gnu
+# only goes to FABRIC_1.6. On the live run the plugin LOADED but then failed with
+# "libfabric.so.1: version `FABRIC_1.8' not found" -> NCCL fell back to Socket.
+# Prepending the AWS libfabric dir makes the plugin resolve FABRIC_1.8 (dlopen-verified).
+# This dir contains ONLY libfabric (no cuDNN), so it does NOT re-trigger the cuDNN
+# symbol clash the run script avoids via SKIP_SYS_LDPATH. Preserve the CUDA paths after.
+ENV FI_PROVIDER=efa \
+    FI_EFA_USE_DEVICE_RDMA=1 \
+    NCCL_NET_PLUGIN=/opt/amazon/ofi-nccl/lib/libnccl-net.so \
+    NCCL_PROTO=simple \
+    LD_LIBRARY_PATH=/opt/amazon/efa/lib:/usr/local/cuda/lib64:/usr/local/nvidia/lib:/usr/local/nvidia/lib64
+
+# Base image's ENTRYPOINT/CMD is inherited unchanged — the Greenland bootstrap
+# still supplies the container command at submit time.

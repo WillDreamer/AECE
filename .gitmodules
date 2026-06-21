@@ -1,0 +1,4 @@
+[submodule "slime"]
+	path = slime
+	url = https://github.com/WillDreamer/slime.git
+	branch = aece
