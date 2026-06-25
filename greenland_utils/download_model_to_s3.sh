@@ -13,8 +13,8 @@ set -euo pipefail
 
 
 # ---- Config -------------------------------------------------------------
-MODEL_REPO="${1:-Qwen/Qwen3.5-35B-A3B-Base}"          # <-- exact HF repo id
-S3_DEST="${2:-s3://whx-agent/Qwen3.5/Qwen3.5-35B-A3B-Base/}"  # target S3 prefix (trailing slash recommended)
+MODEL_REPO="${1:-Qwen/Qwen3.5-122B-A10B}"          # <-- exact HF repo id
+S3_DEST="${2:-s3://whx-agent/Qwen3.5/Qwen3.5-122B-A10B/}"  # target S3 prefix (trailing slash recommended)
 AWS_PROFILE_NAME="${AWS_PROFILE_NAME:-greenland-dev}"    # AWS profile used for S3 access
 
 # Local scratch dir (on /local which has the most space on a dev-dsk).

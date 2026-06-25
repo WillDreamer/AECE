@@ -280,6 +280,10 @@ export SKIP_SYS_LDPATH=1
 export SLIME_DIR={cfg["container_slime_dir"]}
 export MEGATRON_DIR={cfg["container_megatron_dir"]}
 export RAY_TEMP_DIR=$ROOT_DIR/ray_temp
+# Checkpoint retention (--save-retain-interval): so the in-cluster prune
+# in train.py can mirror its local deletion to S3, tell it the local->S3 root map.
+export CKPT_LOCAL_MODEL_ROOT="$MODEL_ROOT"
+export CKPT_S3_MODEL_ROOT="{cfg["model_s3"]}"
 export WANDB_API_KEY="{wandb_key}"
 {hf_lines}
 {extra_env_lines}
@@ -452,10 +456,12 @@ def cli():
               help="Extra container env as KEY=VALUE (repeatable).")
 @click.option("--no-upload", is_flag=True, default=False,
               help="Skip uploading local slime to S3 (use code already staged there).")
+@click.option("--production/--no-production", "is_production", default=False,
+              help="Submit as a PRODUCTION job (IsProduction=true). Default is non-production.")
 @click.option("--dry-run", is_flag=True, default=False,
               help="Print the job definition and bootstrap, do not submit.")
 def obx(script, num_nodes, rollout_nodes, user_sim_nodes, job_name, image, wandb_key, hf_token, stage_model,
-        stage_data, extra_env, no_upload, dry_run):
+        stage_data, extra_env, no_upload, is_production, dry_run):
     """Submit an OBX slime ASYNC training job."""
     cfg = load_config()
 
@@ -576,7 +582,7 @@ def obx(script, num_nodes, rollout_nodes, user_sim_nodes, job_name, image, wandb
         "Topology": "Zonal",
         "InitiativeId": cfg["initiative_id"],
         "InstanceType": cfg["instance_type"],
-        "IsProduction": False,
+        "IsProduction": is_production,
         "InstanceCount": num_nodes,
         "Role": cfg["role"],
         "region": cfg["region"],
@@ -616,6 +622,7 @@ def obx(script, num_nodes, rollout_nodes, user_sim_nodes, job_name, image, wandb
     print(f"\nSubmitting OBX job: {full_job_name}", flush=True)
     print(f"  Script:  {script_rel}", flush=True)
     print(f"  Image:   {image or cfg['image']}", flush=True)
+    print(f"  IsProduction: {is_production}", flush=True)
     if rollout_nodes > 0:
         actor_rollout_nodes = rollout_nodes - user_sim_nodes
         usim = (f" [of which {user_sim_nodes} user-sim ({user_sim_nodes * 8} GPU) "
