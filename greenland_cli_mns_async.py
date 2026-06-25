@@ -176,6 +176,46 @@ def _list_all_jobs(cfg, limited_fields=True, max_pages=50):
 # ═══════════════════════════════════════════════════════════════
 # Bootstrap script (runs inside the container as the batch command)
 # ═══════════════════════════════════════════════════════════════
+# GPU keep-busy used DURING S3 staging. The Greenland stuck-job detector is a GPU
+# electrical-IDLE watchdog (power < ~82W on P5EN); while the bootstrap is
+# `aws s3 sync`-ing the model + (now ~26GB) data to NVMe, the GPUs sit at 0W and
+# the detector can SIGKILL the job before training ever starts (job 63b76437 died
+# at the workspace-bench data-staging step this way, exitCode=137). This tiny
+# loop runs a small matmul on every visible GPU to hold power above the threshold
+# during staging only; it is killed the instant staging finishes so it never
+# competes with SGLang/Megatron for memory. Deliberately minimal + fully guarded:
+# if torch is missing or there is no GPU it exits cleanly (staging proceeds either
+# way). Small tensors (1024^2) + a sleep keep utilization low but power non-idle.
+_GPU_KEEPBUSY_PY = r"""
+import os, time
+try:
+    import torch
+    if not torch.cuda.is_available():
+        raise SystemExit(0)
+    n = torch.cuda.device_count()
+    streams = []
+    mats = []
+    for i in range(n):
+        torch.cuda.set_device(i)
+        a = torch.randn(1024, 1024, device=f"cuda:{i}")
+        b = torch.randn(1024, 1024, device=f"cuda:{i}")
+        mats.append((a, b))
+    # Loop until the parent kills us (staging done). Touch every GPU each pass.
+    while True:
+        for i in range(n):
+            torch.cuda.set_device(i)
+            a, b = mats[i]
+            c = a @ b
+            _ = c.sum().item()  # force sync so the kernel actually runs
+        time.sleep(0.2)
+except SystemExit:
+    pass
+except Exception:
+    # Never let keep-busy failure affect staging.
+    pass
+"""
+
+
 def _build_bootstrap(cfg, script_rel, wandb_key, hf_token, stage_model, stage_data, extra_env,
                      rollout_nodes=0, user_sim_nodes=0):
     """Render the in-container bootstrap bash. Passed base64-encoded as the
@@ -212,6 +252,10 @@ def _build_bootstrap(cfg, script_rel, wandb_key, hf_token, stage_model, stage_da
             f'mkdir -p "$DATA_ROOT/{p}"\n'
             f'$AWS s3 sync "{cfg["data_s3"]}/{p}/" "$DATA_ROOT/{p}/" --only-show-errors'
         )
+
+    # base64 the GPU keep-busy script so it embeds in the bootstrap without any
+    # bash/f-string quoting hazards (decoded + run in the container during staging).
+    gpu_keepbusy_b64 = base64.b64encode(_GPU_KEEPBUSY_PY.encode("utf-8")).decode("ascii")
 
     extra_env_lines = "\n".join(f'export {k}="{v}"' for k, v in extra_env.items())
     # Only export HF creds when present, so an unset token doesn't blank out
@@ -265,14 +309,45 @@ export MODEL_ROOT={cfg["nvme_root"]}/model_root
 export DATA_ROOT={cfg["nvme_root"]}/data_root
 mkdir -p "$MODEL_ROOT" "$DATA_ROOT" "$ROOT_DIR/ray_temp"
 
+# ── 3a. GPU keep-busy DURING staging (defeats the GPU-idle stuck-job detector) ──
+# S3 staging (esp. the ~26GB workspace-bench data) leaves the GPUs at 0W; the
+# Greenland watchdog (power < ~82W on P5EN) can SIGKILL the job before training
+# starts (job 63b76437 died this way at the data-staging step). Run a tiny matmul
+# loop on every GPU to hold power above the threshold, then kill it the instant
+# staging completes so it never competes with SGLang/Megatron for memory. Fully
+# guarded: no torch / no GPU -> it exits cleanly and staging proceeds regardless.
+KEEPBUSY_PID=""
+if command -v python3 >/dev/null 2>&1; then
+  printf '%s' "{gpu_keepbusy_b64}" | base64 -d > /tmp/gpu_keepbusy.py 2>/dev/null || true
+  ( python3 /tmp/gpu_keepbusy.py >/dev/null 2>&1 ) &
+  KEEPBUSY_PID=$!
+  log "started GPU keep-busy (pid $KEEPBUSY_PID) to avoid the idle-GPU stuck-job detector during staging"
+fi
+stop_keepbusy() {{
+  if [ -n "${{KEEPBUSY_PID:-}}" ]; then
+    kill "$KEEPBUSY_PID" 2>/dev/null || true
+    wait "$KEEPBUSY_PID" 2>/dev/null || true
+    log "stopped GPU keep-busy (staging complete)"
+    KEEPBUSY_PID=""
+  fi
+}}
+# Safety net: ensure keep-busy is reaped even if staging aborts early.
+trap stop_keepbusy EXIT
+
 {chr(10).join(stage_model_cmds)}
 {chr(10).join(stage_data_cmds)}
+
+# Staging done -> free the GPUs for training/inference.
+stop_keepbusy
 
 # ── 4. Background checkpoint sync (local outputs -> S3) ──
 sync_outputs() {{ $AWS s3 sync "$MODEL_ROOT/{out_prefix}" "{cfg["model_s3"]}/{out_prefix}" --only-show-errors || true; }}
 ( while true; do sleep 300; sync_outputs; done ) &
 SYNC_PID=$!
-trap 'log "final checkpoint sync"; sync_outputs; kill $SYNC_PID 2>/dev/null || true' EXIT
+# This EXIT trap REPLACES the staging-time keep-busy trap (bash keeps only the
+# last EXIT trap). It also calls stop_keepbusy as a final backstop — harmless
+# no-op once staging already stopped it (KEEPBUSY_PID was cleared).
+trap 'log "final checkpoint sync"; stop_keepbusy; sync_outputs; kill $SYNC_PID 2>/dev/null || true' EXIT
 
 # ── 5. Env for the run script (overrides its dev-box defaults) ──
 # Skip the script's dev-box LD_LIBRARY_PATH prepend (it breaks cuDNN in this image).
